@@ -37,6 +37,11 @@ except ImportError:
     pass
 
 # --- Constants & Configuration ---
+SUBDOMAIN_WORDLIST = [
+    "www", "dev", "admin", "api", "blog", "test", "stage", "prod", "mail", "vpn", "portal", "cdn", "shop",
+    "app", "beta", "demo", "internal", "external", "private", "public", "old", "new", "temp", "tmp", "backup"
+]
+
 DEFAULT_CONFIG = {
     "api_keys": {
         "shodan": "",
@@ -135,6 +140,20 @@ class ReconModule:
         except Exception:
             return False
 
+    async def dns_records_deep_dive(self, target_id, domain):
+        self.logger.info(f"Performing DNS records deep dive for {domain}")
+        record_types = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA", "SPF"]
+        for record_type in record_types:
+            try:
+                result = await self.resolver.query(domain, record_type)
+                for r in result:
+                    self.logger.debug(f"DNS {record_type} record for {domain}: {r}")
+                    # Store relevant DNS records in DB if needed
+            except aiodns.error.DNSError:
+                pass
+            except Exception as e:
+                self.logger.error(f"Error querying {record_type} for {domain}: {e}")
+
     async def passive_recon(self, target_id, domain):
         self.logger.info(f"Starting passive recon for {domain}")
         
@@ -165,6 +184,17 @@ class ReconModule:
             except Exception as e:
                 self.logger.error(f"Error in VirusTotal recon: {e}")
 
+    async def asn_ip_enumeration(self, target_id, domain):
+        self.logger.info(f"Performing ASN & IP enumeration for {domain}")
+        try:
+            # Placeholder for whois lookup and BGP lookups
+            # For a real implementation, use libraries like `python-whois` and `pyasn`
+            self.logger.debug(f"Simulating ASN/IP enumeration for {domain}")
+            # Example: Add a dummy IP range
+            # self.db.add_ip_range(target_id, "192.168.1.0/24", "WHOIS")
+        except Exception as e:
+            self.logger.error(f"Error in ASN/IP enumeration: {e}")
+
     async def permutation_engine(self, target_id, domain, subdomains):
         self.logger.info(f"Generating permutations for {domain}")
         prefixes = ["dev", "staging", "test", "api", "admin", "vpn", "mail", "portal", "prod"]
@@ -192,6 +222,37 @@ class ReconModule:
                 await self.resolve_subdomain(target_id, full_sub)
 
         await asyncio.gather(*(bounded_resolve(s) for s in subs), return_exceptions=True)
+
+    async def recursive_subdomain_discovery(self, target_id, domain, depth=2):
+        self.logger.info(f"Starting recursive subdomain discovery for {domain} (depth: {depth})")
+        if depth == 0: return
+
+        cursor = self.db.conn.cursor()
+        cursor.execute("SELECT subdomain FROM subdomains WHERE target_id = ?", (target_id,))
+        initial_subdomains = {r[0] for r in cursor.fetchall()}
+
+        newly_discovered = set()
+        for sub in initial_subdomains:
+            try:
+                # Re-run passive recon for each subdomain
+                await self.passive_recon(target_id, sub)
+                # Re-run bruteforce for each subdomain
+                # await self.dns_bruteforce(target_id, sub, "/home/ubuntu/Aegis-Omni-Project/subdomains-wordlist.txt")
+                # Re-run permutation for each subdomain
+                # await self.permutation_engine(target_id, sub, {sub})
+
+                # Check for new subdomains added during this iteration
+                cursor.execute("SELECT subdomain FROM subdomains WHERE target_id = ?", (target_id,))
+                current_subdomains = {r[0] for r in cursor.fetchall()}
+                new_subs_this_round = current_subdomains - initial_subdomains
+                newly_discovered.update(new_subs_this_round)
+
+            except Exception as e:
+                self.logger.error(f"Error in recursive recon for {sub}: {e}")
+
+        if newly_discovered:
+            self.logger.info(f"Discovered {len(newly_discovered)} new subdomains recursively. Continuing...")
+            await self.recursive_subdomain_discovery(target_id, domain, depth - 1)
 
 # --- Module 2: Hyper-Intelligent Dorking & OSINT (The Ghost) ---
 class GhostModule:
@@ -368,6 +429,16 @@ class AegisOmni:
             # 1. Recon
             recon = ReconModule(session, self.db, self.logger, self.config)
             await recon.passive_recon(target_id, domain)
+            await recon.dns_records_deep_dive(target_id, domain)
+            await recon.asn_ip_enumeration(target_id, domain)
+            await recon.dns_bruteforce(target_id, domain, SUBDOMAIN_WORDLIST)
+            
+            # Get current subdomains for permutation engine
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT subdomain FROM subdomains WHERE target_id = ?", (target_id,))
+            current_subdomains = [r[0] for r in cursor.fetchall()]
+            await recon.permutation_engine(target_id, domain, current_subdomains)
+            await recon.recursive_subdomain_discovery(target_id, domain)
             
             # 2. Ghost (Dorking)
             ghost = GhostModule(session, self.db, self.logger, self.config)
